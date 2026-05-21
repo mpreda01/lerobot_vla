@@ -84,15 +84,90 @@ from lerobot.envs import (
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
-from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.import_utils import register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _to_hwc_uint8(image: Tensor | np.ndarray) -> np.ndarray:
+    """Convert any image tensor/array to HWC uint8 format for Rerun logging."""
+    array = image.detach().cpu().numpy() if isinstance(image, Tensor) else np.asarray(image)
+    if array.ndim == 4:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    if np.issubdtype(array.dtype, np.floating):
+        if np.nanmax(array) <= 1.0:
+            array = array * 255.0
+        array = np.clip(array, 0.0, 255.0).astype(np.uint8)
+    return array
+
+
+def make_rerun_step_callback(
+    rr_prefix: str,
+    episode_max_steps: int = 500,
+) -> "Callable[[int, dict[str, Any], np.ndarray], None]":
+    """
+    Returns a rerun_step_callback that logs camera images and action dims
+    under the given prefix (e.g. 'smolvla' or 'xvla').
+
+    The blueprint must be created and rr.init() + rr.notebook_show() must be
+    called in the notebook BEFORE calling eval_policy. This function only
+    adds rr.log() calls — it never calls rr.init(), rr.save(), or rr.notebook_show().
+
+    Blueprint expected in notebook:
+        smolvla/observation/image   — main camera
+        smolvla/observation/image2  — wrist camera
+        smolvla/action/0..N         — action dimensions
+        xvla/observation/image      — main camera
+        xvla/observation/image2     — wrist camera
+        xvla/action/0..N            — action dimensions
+
+    Args:
+        rr_prefix: model identifier used as entity path prefix, e.g. "smolvla" or "xvla"
+        episode_max_steps: max steps per episode, used to offset timeline per episode
+    """
+    try:
+        import rerun as rr
+    except ImportError:
+        raise ImportError("rerun-sdk is required. Install with: pip install 'rerun-sdk[notebook]'")
+
+    # episode counter to offset timeline so episodes don't overlap
+    state = {"episode": 0, "prev_step": -1}
+
+    def callback(step: int, observation: dict[str, Any], action: np.ndarray) -> None:
+        # detect episode boundary: step resets to 0 after first episode
+        if step < state["prev_step"]:
+            state["episode"] += 1
+        state["prev_step"] = step
+
+        timeline_step = state["episode"] * episode_max_steps + step
+        rr.set_time(timeline="step", sequence=timeline_step)
+
+        # log main camera
+        image = observation.get(f"{OBS_IMAGES}.image")
+        if image is not None:
+            rr.log(f"{rr_prefix}/observation/image", rr.Image(_to_hwc_uint8(image)))
+
+        # log wrist camera
+        image2 = observation.get(f"{OBS_IMAGES}.image2")
+        if image2 is not None:
+            rr.log(f"{rr_prefix}/observation/image2", rr.Image(_to_hwc_uint8(image2)))
+
+        # log action dimensions
+        action_array = np.asarray(action)
+        if action_array.ndim > 1:
+            action_array = action_array[0]
+        for action_ix, action_value in enumerate(action_array.reshape(-1)):
+            rr.log(f"{rr_prefix}/action/{action_ix}", rr.Scalars(float(action_value)))
+
+    return callback
 
 
 def rollout(
@@ -105,6 +180,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    rerun_step_callback: Callable[[int, dict[str, Any], np.ndarray], None] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -198,6 +274,8 @@ def rollout(
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
+        if rerun_step_callback is not None:
+            rerun_step_callback(step, observation, action_numpy)
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available if none of the envs finished.
@@ -273,6 +351,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    rerun_step_callback: Callable[[int, dict[str, Any], np.ndarray], None] | None = None,
 ) -> dict:
     """
     Args:
@@ -361,6 +440,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            rerun_step_callback=rerun_step_callback,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -563,35 +643,46 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        info = eval_policy_all(
-            envs=envs,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
-            videos_dir=Path(cfg.output_dir) / "videos",
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
-        )
-        print("Overall Aggregated Metrics:")
-        print(info["overall"])
+    rerun_step_callback = None
+    try:
+        from lerobot.utils.visualization_utils import shutdown_rerun
+        use_rerun_shutdown = True
+    except ImportError:
+        use_rerun_shutdown = False
 
-        # Print per-suite stats
-        for task_group, task_group_info in info.items():
-            print(f"\nAggregated Metrics for {task_group}:")
-            print(task_group_info)
-    # Close all vec envs
-    close_envs(envs)
+    try:
+        with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+            info = eval_policy_all(
+                envs=envs,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                n_episodes=cfg.eval.n_episodes,
+                max_episodes_rendered=10,
+                videos_dir=Path(cfg.output_dir) / "videos",
+                start_seed=cfg.seed,
+                max_parallel_tasks=cfg.env.max_parallel_tasks,
+                rerun_step_callback=rerun_step_callback,
+            )
+            print("Overall Aggregated Metrics:")
+            print(info["overall"])
 
-    # Save info
-    with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
-        json.dump(info, f, indent=2)
+            # Print per-suite stats
+            for task_group, task_group_info in info.items():
+                print(f"\nAggregated Metrics for {task_group}:")
+                print(task_group_info)
 
-    logging.info("End of eval")
+        # Save info
+        with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
+            json.dump(info, f, indent=2)
+
+        logging.info("End of eval")
+    finally:
+        close_envs(envs)
+        if use_rerun_shutdown:
+            shutdown_rerun()
 
 
 # ---- typed payload returned by one task eval ----
@@ -618,6 +709,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    rerun_step_callback: Callable[[int, dict[str, Any], np.ndarray], None] | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -635,6 +727,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rerun_step_callback=rerun_step_callback,
     )
 
     per_episode = task_result["per_episode"]
@@ -661,6 +754,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    rerun_step_callback: Callable[[int, dict[str, Any], np.ndarray], None] | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -685,6 +779,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rerun_step_callback=rerun_step_callback,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -706,6 +801,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    rerun_step_callback: Callable[[int, dict[str, Any], np.ndarray], None] | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -761,6 +857,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rerun_step_callback=rerun_step_callback,
     )
 
     if max_parallel_tasks <= 1:
