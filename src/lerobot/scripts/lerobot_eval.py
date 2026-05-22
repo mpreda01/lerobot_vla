@@ -106,6 +106,7 @@ def _to_hwc_uint8(image: Tensor | np.ndarray) -> np.ndarray:
         if np.nanmax(array) <= 1.0:
             array = array * 255.0
         array = np.clip(array, 0.0, 255.0).astype(np.uint8)
+    array = np.rot90(array, k=2)
     return array
 
 
