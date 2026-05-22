@@ -150,13 +150,17 @@ def make_rerun_step_callback(
         timeline_step = state["episode"] * episode_max_steps + step
         rr.set_time(timeline="step", sequence=timeline_step)
 
+        # The observation coming from env.step() is a raw numpy dict with gymnasium-style
+        # keys. We must convert it to LeRobot format before looking up OBS_IMAGES keys.
+        processed_obs = preprocess_observation(observation)
+
         # log main camera
-        image = observation.get(f"{OBS_IMAGES}.image")
+        image = processed_obs.get(f"{OBS_IMAGES}.image")
         if image is not None:
             rr.log(f"{rr_prefix}/observation/image", rr.Image(_to_hwc_uint8(image)))
 
         # log wrist camera
-        image2 = observation.get(f"{OBS_IMAGES}.image2")
+        image2 = processed_obs.get(f"{OBS_IMAGES}.image2")
         if image2 is not None:
             rr.log(f"{rr_prefix}/observation/image2", rr.Image(_to_hwc_uint8(image2)))
 
