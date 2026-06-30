@@ -31,22 +31,33 @@ are gated behind optional extras::
     pip install 'lerobot[all]'           # everything
 """
 
-def _patch_mujoco_mj_fullM_arg_order():
+def _patch_robosuite_mujoco_compat():
+    import os, re
     try:
-        import mujoco
-        _orig_mj_fullM = mujoco.mj_fullM
-
-        def _compat_mj_fullM(m, dst_or_d, d_or_dst):
-            # Detect old-style call: (model, dst_array, qM_array) vs new (model, data, dst_array)
-            if hasattr(d_or_dst, "qM") or type(d_or_dst).__name__ == "MjData":
-                return _orig_mj_fullM(m, d_or_dst, dst_or_d)
-            return _orig_mj_fullM(m, dst_or_d, d_or_dst)
-
-        mujoco.mj_fullM = _compat_mj_fullM
+        import robosuite
     except ImportError:
-        pass
+        return
 
-_patch_mujoco_mj_fullM_arg_order()
+    path = os.path.join(os.path.dirname(robosuite.__file__), "controllers", "base_controller.py")
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r") as f:
+        content = f.read()
+
+    old_line = "mujoco.mj_fullM(self.sim.model._model, mass_matrix, self.sim.data.qM)"
+    new_line = "mujoco.mj_fullM(self.sim.model._model, self.sim.data._data, mass_matrix)"
+
+    if old_line in content:
+        content = content.replace(old_line, new_line)
+        with open(path, "w") as f:
+            f.write(content)
+        # force reimport so the patched source takes effect this session too
+        import importlib, sys
+        if "robosuite.controllers.base_controller" in sys.modules:
+            importlib.reload(sys.modules["robosuite.controllers.base_controller"])
+
+_patch_robosuite_mujoco_compat()
 
 from lerobot.__version__ import __version__
 
