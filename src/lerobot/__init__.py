@@ -31,6 +31,23 @@ are gated behind optional extras::
     pip install 'lerobot[all]'           # everything
 """
 
+def _patch_mujoco_mj_fullM_arg_order():
+    try:
+        import mujoco
+        _orig_mj_fullM = mujoco.mj_fullM
+
+        def _compat_mj_fullM(m, dst_or_d, d_or_dst):
+            # Detect old-style call: (model, dst_array, qM_array) vs new (model, data, dst_array)
+            if hasattr(d_or_dst, "qM") or type(d_or_dst).__name__ == "MjData":
+                return _orig_mj_fullM(m, d_or_dst, dst_or_d)
+            return _orig_mj_fullM(m, dst_or_d, d_or_dst)
+
+        mujoco.mj_fullM = _compat_mj_fullM
+    except ImportError:
+        pass
+
+_patch_mujoco_mj_fullM_arg_order()
+
 from lerobot.__version__ import __version__
 
 # Maps optional extras to the CLI entry-points they unlock.
